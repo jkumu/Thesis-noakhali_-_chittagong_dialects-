@@ -1,0 +1,189 @@
+import os
+import numpy as np
+import pandas as pd
+import torch
+
+from datasets import Dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    DataCollatorForSeq2Seq,
+    Adafactor,
+)
+from torch.utils.data import DataLoader
+from torch.nn.utils import clip_grad_norm_
+from tqdm.auto import tqdm
+
+import evaluate
+from jiwer import wer
+
+# ---------- CONFIG ----------
+SEED = 42
+torch.manual_seed(SEED); np.random.seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = False
+torch.backends.cudnn.benchmark = True   # speed + BLEU boost
+
+TARGET_REGION = "Noakhali"
+TARGET_LANG   = "Bangla"
+
+MAX_IN, MAX_OUT = 128, 128
+REAL_BATCH = 8               # physical batch
+ACCUM_STEPS = 2              # 8×2 = effective batch 16
+EPOCHS = 18                  # higher = better for dialect
+NUM_BEAMS = 8
+LENGTH_PENALTY = 1.0
+MAX_GRAD_NORM = 1.0
+
+RUN_ROOT = "./mt_runs_noakhali_v2"
+os.makedirs(RUN_ROOT, exist_ok=True)
+OUT_DIR = os.path.join(RUN_ROOT, f"banglat5_{TARGET_REGION}_{TARGET_LANG}")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Device:", device)
+
+# ---------- df_clean ----------
+assert "df_clean" in globals(), "df_clean আগে রান করো।"
+
+subset = df_clean[
+    (df_clean["region"] == TARGET_REGION) &
+    (df_clean["lang"]   == TARGET_LANG)
+]
+
+train_df = subset[subset["split"]=="train"].reset_index(drop=True)
+val_df   = subset[subset["split"]=="validation"].reset_index(drop=True)
+test_df  = subset[subset["split"]=="test"].reset_index(drop=True)
+
+print("Sizes:", len(train_df), len(val_df), len(test_df))
+
+# ---------- Model ----------
+tokenizer = AutoTokenizer.from_pretrained("csebuetnlp/banglat5")
+model = AutoModelForSeq2SeqLM.from_pretrained(
+    "csebuetnlp/banglat5",
+    revision="main"
+).to(device)
+model.config.dropout_rate = 0.15
+model.config.use_cache = False
+
+# ---------- Dataset ----------
+def preprocess(batch):
+    inp = ["translate dialect to bangla: " + s for s in batch["src_norm"]]
+    enc = tokenizer(inp, truncation=True, max_length=MAX_IN)
+    tgt = tokenizer(text_target=batch["tgt_norm"],
+                    truncation=True, max_length=MAX_OUT)
+    enc["labels"] = tgt["input_ids"]
+    return enc
+
+def get_ds(df):
+    base = Dataset.from_pandas(df[["src_norm","tgt_norm"]].copy())
+    return base.map(preprocess, batched=True,
+                    remove_columns=["src_norm","tgt_norm"])
+
+ds_train = get_ds(train_df)
+ds_val   = get_ds(val_df)
+ds_test  = get_ds(test_df)
+
+collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding=True)
+train_loader = DataLoader(ds_train, batch_size=REAL_BATCH, shuffle=True, collate_fn=collator)
+val_loader   = DataLoader(ds_val,   batch_size=REAL_BATCH, shuffle=False, collate_fn=collator)
+test_loader  = DataLoader(ds_test,  batch_size=REAL_BATCH, shuffle=False, collate_fn=collator)
+
+# ---------- Metrics ----------
+bleu = evaluate.load("sacrebleu")
+
+def metric(preds, refs):
+    preds = [p.strip() for p in preds]
+    refs  = [r.strip() for r in refs]
+    bleu_s = bleu.compute(predictions=preds, references=[[r] for r in refs])["score"]
+    wer_s  = float(np.mean([wer(r,p) for p,r in zip(preds,refs)]))
+    return bleu_s, wer_s
+
+# ---------- Train ----------
+optimizer = Adafactor(model.parameters(),
+                      relative_step=True,
+                      warmup_init=True,
+                      scale_parameter=True,
+                      lr=None)
+
+BEST = -1
+
+for ep in range(1, EPOCHS+1):
+    model.train()
+    total = 0.0
+    pbar = tqdm(train_loader, desc=f"Epoch {ep}/{EPOCHS}")
+    optimizer.zero_grad()
+    step = 0
+
+    for batch in pbar:
+        batch = {k:v.to(device) for k,v in batch.items()}
+
+        out = model(**batch)
+        loss = out.loss / ACCUM_STEPS
+        loss.backward()
+
+        step += 1
+        if step % ACCUM_STEPS == 0:
+            clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+            optimizer.step()
+            optimizer.zero_grad()
+
+        total += loss.item() * ACCUM_STEPS
+        pbar.set_postfix(loss=total/step)
+
+    # ----- Validation -----
+    model.eval()
+    P, R = [], []
+    with torch.no_grad():
+        for batch in val_loader:
+            batch = {k:v.to(device) for k,v in batch.items()}
+            gen = model.generate(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                max_length=MAX_OUT,
+                num_beams=NUM_BEAMS,
+                length_penalty=LENGTH_PENALTY
+            )
+            preds = tokenizer.batch_decode(gen, skip_special_tokens=True)
+            labels = batch["labels"].clone()
+            labels[labels==-100] = tokenizer.pad_token_id
+            refs = tokenizer.batch_decode(labels, skip_special_tokens=True)
+            P += preds; R += refs
+
+    b, w = metric(P,R)
+    print(f"\nVAL epoch {ep}: BLEU={b:.2f} | WER={w:.3f}")
+
+    if b > BEST:
+        BEST = b
+        model.save_pretrained(OUT_DIR)
+        tokenizer.save_pretrained(OUT_DIR)
+        print("💾 Saved best model.")
+
+# ---------- Final Test ----------
+best_model = AutoModelForSeq2SeqLM.from_pretrained(OUT_DIR).to(device)
+best_model.eval()
+
+P,R = [], []
+src = test_df["src_norm"].tolist()
+
+with torch.no_grad():
+    for batch in test_loader:
+        batch = {k:v.to(device) for k,v in batch.items()}
+        gen = best_model.generate(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            max_length=MAX_OUT,
+            num_beams=NUM_BEAMS
+        )
+        preds = tokenizer.batch_decode(gen, skip_special_tokens=True)
+        labels = batch["labels"].clone()
+        labels[labels==-100] = tokenizer.pad_token_id
+        refs = tokenizer.batch_decode(labels, skip_special_tokens=True)
+        P += preds; R += refs
+
+tb, tw = metric(P,R)
+print("\n=== FINAL TEST ===")
+print("BLEU =", tb)
+print("WER  =", tw)
+print("Saved:", OUT_DIR)
