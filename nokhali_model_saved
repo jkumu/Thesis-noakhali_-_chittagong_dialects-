@@ -1,0 +1,29 @@
+import torch
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Device:", device)
+
+# --- Noakhali model dir (তোমার আউটপুটে যেটা ছিল) ---
+NOAKHALI_DIR = "./mt_runs_noakhali_v2/banglat5_Noakhali_Bangla"
+
+# মডেল + টোকেনাইজার লোড
+tok_noa   = AutoTokenizer.from_pretrained(NOAKHALI_DIR)
+model_noa = AutoModelForSeq2SeqLM.from_pretrained(NOAKHALI_DIR).to(device)
+model_noa.eval()
+
+def translate_noakhali(sentence, max_len=64):
+    """Noakhali dialect → Std Bangla (BanglaT5 fine-tuned model)"""
+    prompt = "translate dialect to bangla: " + sentence
+    enc = tok_noa(prompt, return_tensors="pt",
+                  truncation=True, max_length=max_len).to(device)
+    with torch.no_grad():
+        gen = model_noa.generate(
+            input_ids=enc["input_ids"],
+            attention_mask=enc["attention_mask"],
+            max_length=max_len,
+            num_beams=8,
+            length_penalty=1.0,
+        )
+    out = tok_noa.batch_decode(gen, skip_special_tokens=True)
+    return out[0] if len(out) > 0 else ""
