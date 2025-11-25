@@ -1,0 +1,89 @@
+import os, glob, random
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+# reproducibility
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+
+TARGET_REGION = "Chittagong"   
+
+DATA_DIR = "."   
+
+# --- সব *Translation.csv ফাইল তালিকা ---
+vash_files = sorted(glob.glob(os.path.join(DATA_DIR, "*Translation.csv")))
+print("Found files:")
+for p in vash_files:
+    print(" -", Path(p).name)
+
+# --- region / split বের করার helper ---
+def guess_region_split(p):
+    name  = Path(p).name.replace(".csv","")
+    parts = name.split()
+    split = None
+    for s in ["Train","Validation","Test"]:
+        if s in parts:
+            split = s.lower()
+    assert split, f"Split not found in {name}"
+    ridx   = parts.index(split.capitalize())
+    region = " ".join(parts[:ridx]).strip()
+    return region, split
+
+# --- column detect করার helper ---
+def pick_vash_cols(df, region_key):
+    cols = list(df.columns)
+    low  = {c.strip().lower().replace(" ",""): c for c in cols}
+    tgt = low.get("bangla_speech", None)
+    assert tgt, "bangla_speech column not found"
+    src = low.get(f"{region_key}_bangla_speech", None)
+    assert src, f"{region_key}_bangla_speech column not found"
+    return src, tgt
+
+
+try:
+    from normalizer import normalize as bn_normalize
+    def bn_norm(x):
+        try: return bn_normalize(str(x))
+        except: return str(x).strip()
+    print("Using csebuetnlp normalizer ✅")
+except Exception:
+    def bn_norm(x):
+        return str(x).strip()
+    print("Using simple strip normalizer (no external lib).")
+
+rows = []
+reg_key = TARGET_REGION.lower()  # "chittagong"
+
+for p in vash_files:
+    region, split = guess_region_split(p)
+    if region != TARGET_REGION:
+        continue
+    df = pd.read_csv(p)
+    df.columns = [c if isinstance(c,str) else str(c) for c in df.columns]
+    src_col, tgt_col = pick_vash_cols(df, reg_key)
+    sub = df[[src_col, tgt_col]].copy()
+    sub.columns = ["src","tgt"]
+    sub["region"] = TARGET_REGION
+    sub["split"]  = split
+    sub["lang"]   = "Bangla"     # dialect → Std Bangla
+    rows.append(sub)
+
+assert len(rows) > 0, f"No files matched region={TARGET_REGION}"
+
+vash = pd.concat(rows, ignore_index=True)
+print(f"\n[Vashantor] {TARGET_REGION} rows per split:")
+print(vash["split"].value_counts())
+
+# --- normalize + dedup ---
+vash["src_norm"] = vash["src"].astype(str).apply(bn_norm)
+vash["tgt_norm"] = vash["tgt"].astype(str).apply(bn_norm)
+vash = vash.drop_duplicates(subset=["src_norm","tgt_norm"]).reset_index(drop=True)
+
+# --- final df_clean ---
+df_clean = vash[["src","tgt","src_norm","tgt_norm","region","split","lang"]].copy()
+
+print("\nSizes ->", df_clean["split"].value_counts().to_dict())
+print("\nSample rows:")
+print(df_clean.head())
