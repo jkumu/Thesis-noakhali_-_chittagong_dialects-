@@ -1,0 +1,51 @@
+import torch
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+
+MODEL_DIR = r"./mt_runs_combo/banglat5_Chittagong_Bangla"
+
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_DIR).to(device)
+model.eval()
+
+MAX_OUT = 128
+
+def translate_ctg(sentence_or_list):
+   
+    Chittagong dialect --> Standard Bangla
+    
+  
+    if isinstance(sentence_or_list, str):
+        sentences = [sentence_or_list]
+        single = True
+    else:
+        sentences = list(sentence_or_list)
+        single = False
+
+    prompts = ["translate dialect to bangla: " + s for s in sentences]
+
+    enc = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=MAX_OUT,
+    ).to(device)
+
+    with torch.no_grad():
+        gen = model.generate(
+            **enc,
+            max_length=MAX_OUT,
+            num_beams=7,
+            length_penalty=1.1,
+            no_repeat_ngram_size=3,
+        )
+
+    outputs = tokenizer.batch_decode(gen, skip_special_tokens=True)
+
+    return outputs[0] if single else outputs
