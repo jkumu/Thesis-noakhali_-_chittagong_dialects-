@@ -1,0 +1,435 @@
+import os, glob, random
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+
+from datasets import Dataset
+from torch.utils.data import DataLoader
+from torch.nn.utils import clip_grad_norm_
+from tqdm.auto import tqdm
+
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    DataCollatorForSeq2Seq,
+    Adafactor,
+    get_constant_schedule,
+)
+
+import evaluate
+from jiwer import wer, cer
+
+# ---------- CONFIG ----------
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+MAX_IN, MAX_OUT   = 128, 128
+BATCH_SIZE        = 8
+EPOCHS            = 15
+NUM_BEAMS         = 5
+LENGTH_PENALTY    = 1.0
+MAX_GRAD_NORM     = 0.8
+LEARNING_RATE     = 1e-4
+EARLY_STOP_PATIENCE = 3
+
+RUN_ROOT = "./mt_runs_combo_all"
+os.makedirs(RUN_ROOT, exist_ok=True)
+OUT_DIR = os.path.join(RUN_ROOT, "banglat5_Chittagong_AllSources")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+# ---------- Bangla normalizer (optional but useful) ----------
+try:
+    from normalizer import normalize
+    def bn_norm(x):
+        try:
+            return normalize(str(x))
+        except Exception:
+            return str(x)
+except Exception:
+    print("⚠️ normalizer না পেলে raw text ব্যবহার হবে।")
+    def bn_norm(x):
+        return str(x)
+
+# ========== A) Load Vashantor (Chittagong only) ==========
+def guess_region_split(p):
+    name  = Path(p).name.replace(".csv","")
+    parts = name.split()
+    split = None
+    for s in ["Train","Validation","Test"]:
+        if s in parts:
+            split = s.lower()
+    assert split, f"Split not found in {name}"
+    ridx   = parts.index(split.capitalize())
+    region = " ".join(parts[:ridx]).strip()
+    return region, split
+
+vash_files = sorted(glob.glob("*Translation.csv"))
+assert vash_files, "Translation CSV files not found in current folder"
+
+rows = []
+for p in vash_files:
+    region, split = guess_region_split(p)
+    if region != "Chittagong":
+        continue
+    df = pd.read_csv(p)
+    df.columns = [c.strip() if isinstance(c,str) else str(c) for c in df.columns]
+    low = {c.strip().lower().replace(" ",""): c for c in df.columns}
+
+    tgt_col = low.get("bangla_speech", None)
+    assert tgt_col, f"bangla_speech missing in {Path(p).name}"
+
+    rk = "chittagong"
+    src_col = low.get(f"{rk}_bangla_speech", None)
+    assert src_col, f"{rk}_bangla_speech missing in {Path(p).name}"
+
+    sub = df[[src_col, tgt_col]].copy()
+    sub.columns = ["src", "tgt"]
+    sub["source"] = "vashantor"
+    sub["split"]  = split
+    rows.append(sub)
+
+assert rows, "No Vashantor rows for Chittagong found."
+vash = pd.concat(rows, ignore_index=True)
+print("\n[Vashantor] Chittagong rows per split:")
+print(vash["split"].value_counts())
+
+# ========== B) Load ONUBAD (Sentence / Clause / Word) ==========
+
+onu_files = [f for f in ["Sentence.xlsx", "Clause.xlsx", "Word.xlsx"] if os.path.exists(f)]
+print("\nONUBAD files found:", onu_files)
+
+def load_onubad_file(path):
+    df = pd.read_excel(path)
+    orig_cols = list(df.columns)
+    low = {c: str(c).strip().lower() for c in orig_cols}
+
+    # Possible header names (seen from your files)
+    std_keys = ["standard bangla lanuguage", "standard bangla language", "standard bangla"]
+    ctg_keys = ["chittagong language", "chittagong"]
+
+    def find(keys):
+        for k in keys:
+            for c in orig_cols:
+                if low[c] == k:
+                    return c
+        for c in orig_cols:
+            for k in keys:
+                if k in low[c]:
+                    return c
+        return None
+
+    tgt_col = find(std_keys)
+    src_col = find(ctg_keys)
+    if tgt_col is None or src_col is None:
+        raise ValueError(f"Could not find dialect/std columns in {path}. Columns: {orig_cols}")
+
+    sub = df[[src_col, tgt_col]].copy()
+    sub.columns = ["src", "tgt"]
+    sub = sub.dropna(subset=["src","tgt"])
+    sub["src"] = sub["src"].astype(str).str.strip()
+    sub["tgt"] = sub["tgt"].astype(str).str.strip()
+    sub = sub[(sub["src"]!="") & (sub["tgt"]!="")]
+    return sub
+
+onu_rows = []
+for p in onu_files:
+    try:
+        sub = load_onubad_file(p)
+        sub["source"] = "onubad"
+        onu_rows.append(sub)
+        print(f"[ONUBAD OK] {p}: rows={len(sub)}")
+    except Exception as e:
+        print(f"[ONUBAD SKIP] {p} -> {e}")
+
+if onu_rows:
+    onubad_all = pd.concat(onu_rows, ignore_index=True)
+    # 80/10/10 split
+    idx = np.random.permutation(len(onubad_all))
+    n_tr = int(0.8*len(idx))
+    n_va = int(0.1*len(idx))
+    onubad_all["split"] = "test"
+    onubad_all.loc[idx[:n_tr], "split"] = "train"
+    onubad_all.loc[idx[n_tr:n_tr+n_va], "split"] = "validation"
+    print("\n[ONUBAD] rows per split:")
+    print(onubad_all["split"].value_counts())
+else:
+    onubad_all = pd.DataFrame(columns=["src","tgt","source","split"])
+    print("\n[ONUBAD] No usable rows found.")
+
+# ========== C) Load Chatgaiya Alap ==========
+
+chat_path = None
+for cand in glob.glob("*chatgaiya*alap*.xlsx"):
+    chat_path = cand
+    break
+
+if chat_path is None:
+    print("\n⚠️ Chatgaiya Alap file not found. Skipping.")
+    chat = pd.DataFrame(columns=["src","tgt","source","split"])
+else:
+    # find header row containing "Standard Bangla Lanuguage"
+    tmp = pd.read_excel(chat_path, header=None)
+    header_row = None
+    for i, row in tmp.iterrows():
+        if row.astype(str).str.contains("Standard Bangla", case=False, na=False).any():
+            header_row = i
+            break
+    if header_row is None:
+        raise ValueError("Could not detect header row in Chatgaiya Alap.")
+
+    df_chat = pd.read_excel(chat_path, header=header_row)
+    df_chat = df_chat.dropna(how="all")
+
+    cols = list(df_chat.columns)
+    low = {c: str(c).strip().lower() for c in cols}
+
+    std_keys = ["standard bangla lanuguage", "standard bangla language", "standard bangla"]
+    ctg_keys = ["chittagong language", "chittagong"]
+
+    def find_chat(keys):
+        for k in keys:
+            for c in cols:
+                if low[c] == k:
+                    return c
+        for c in cols:
+            for k in keys:
+                if k in low[c]:
+                    return c
+        return None
+
+    tgt_col = find_chat(std_keys)
+    src_col = find_chat(ctg_keys)
+    if tgt_col is None or src_col is None:
+        raise ValueError(f"Chatgaiya Alap: could not find dialect/std columns. Columns: {cols}")
+
+    sub = df_chat[[src_col, tgt_col]].copy()
+    sub.columns = ["src", "tgt"]
+    sub = sub.dropna(subset=["src","tgt"])
+    sub["src"] = sub["src"].astype(str).str.strip()
+    sub["tgt"] = sub["tgt"].astype(str).str.strip()
+    sub = sub[(sub["src"]!="") & (sub["tgt"]!="")]
+
+    # 80/10/10 split
+    idx = np.random.permutation(len(sub))
+    n_tr = int(0.8*len(idx))
+    n_va = int(0.1*len(idx))
+    sub["split"] = "test"
+    sub.loc[idx[:n_tr], "split"] = "train"
+    sub.loc[idx[n_tr:n_tr+n_va], "split"] = "validation"
+    sub["source"] = "chatgaiya"
+
+    chat = sub
+    print(f"\n[Chatgaiya Alap] rows per split:")
+    print(chat["split"].value_counts())
+
+# ========== D) Merge + normalize + de-dup ==========
+
+df_all = pd.concat([vash, onubad_all, chat], ignore_index=True)
+df_all["src_norm"] = df_all["src"].astype(str).apply(bn_norm)
+df_all["tgt_norm"] = df_all["tgt"].astype(str).apply(bn_norm)
+df_all = df_all.drop_duplicates(subset=["src_norm","tgt_norm"]).reset_index(drop=True)
+
+train = df_all[df_all["split"]=="train"].reset_index(drop=True)
+val   = df_all[df_all["split"]=="validation"].reset_index(drop=True)
+
+test_vash  = df_all[(df_all["split"]=="test") & (df_all["source"]=="vashantor")].reset_index(drop=True)
+test_onu   = df_all[(df_all["split"]=="test") & (df_all["source"]=="onubad")].reset_index(drop=True)
+test_chat  = df_all[(df_all["split"]=="test") & (df_all["source"]=="chatgaiya")].reset_index(drop=True)
+test_comb  = df_all[df_all["split"]=="test"].reset_index(drop=True)
+
+print("\n[Combined] sizes ->")
+print({
+    "train": len(train),
+    "val": len(val),
+    "test_vashantor": len(test_vash),
+    "test_onubad": len(test_onu),
+    "test_chatgaiya": len(test_chat),
+    "test_combined": len(test_comb),
+})
+
+print("\nSample train rows:")
+print(train[["src","tgt","source","split"]].head())
+
+# ========== E) HF Datasets & Dataloaders ==========
+
+MODEL_NAME = "csebuetnlp/banglat5"
+tokenizer  = AutoTokenizer.from_pretrained(MODEL_NAME)
+model      = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device)
+model.config.use_cache = False
+
+def preprocess(batch):
+    inputs = ["translate dialect to bangla: " + s for s in batch["src_norm"]]
+    enc = tokenizer(inputs, max_length=MAX_IN, truncation=True)
+    tgt = tokenizer(
+        text_target=batch["tgt_norm"],
+        max_length=MAX_OUT,
+        truncation=True
+    )
+    enc["labels"] = tgt["input_ids"]
+    return enc
+
+def make_ds(df):
+    base = Dataset.from_pandas(df[["src_norm","tgt_norm"]].copy())
+    return base.map(preprocess, batched=True, remove_columns=["src_norm","tgt_norm"])
+
+ds_train = make_ds(train)
+ds_val   = make_ds(val)
+ds_tv    = make_ds(test_vash)   if len(test_vash)  > 0 else None
+ds_to    = make_ds(test_onu)    if len(test_onu)   > 0 else None
+ds_tc    = make_ds(test_chat)   if len(test_chat)  > 0 else None
+ds_tall  = make_ds(test_comb)   if len(test_comb)  > 0 else None
+
+collator     = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding=True)
+train_loader = DataLoader(ds_train, batch_size=BATCH_SIZE, shuffle=True,  collate_fn=collator)
+val_loader   = DataLoader(ds_val,   batch_size=BATCH_SIZE, shuffle=False, collate_fn=collator)
+
+def make_loader(ds):
+    if ds is None or len(ds)==0:
+        return None
+    return DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collator)
+
+dl_tv   = make_loader(ds_tv)
+dl_to   = make_loader(ds_to)
+dl_tc   = make_loader(ds_tc)
+dl_tall = make_loader(ds_tall)
+
+# ========== F) Metrics ==========
+bleu_metric = evaluate.load("sacrebleu")
+
+def compute_bleu_wer(preds, refs):
+    preds = [p.strip() for p in preds]
+    refs1 = [r.strip() for r in refs]
+    bleu_score = bleu_metric.compute(
+        predictions=preds,
+        references=[[r] for r in refs1]
+    )["score"]
+    wer_score  = float(np.mean([wer(r, p) for p, r in zip(preds, refs1)]))
+    return bleu_score, wer_score
+
+def compute_all(preds, refs):
+    b, w = compute_bleu_wer(preds, refs)
+    c    = cer(refs, preds)
+    return b, w, c
+
+# ========== G) Optimizer + Scheduler ==========
+optimizer = Adafactor(
+    model.parameters(),
+    lr=LEARNING_RATE,
+    relative_step=False,
+    scale_parameter=False,
+    warmup_init=False,
+)
+scheduler = get_constant_schedule(optimizer)
+
+# ========== H) Train loop with early stopping ==========
+best_bleu = -1.0
+epochs_no_imp = 0
+
+for ep in range(1, EPOCHS + 1):
+    print(f"\n===== Epoch {ep}/{EPOCHS} =====")
+    model.train()
+    total_loss = 0.0
+    pbar = tqdm(train_loader, desc=f"Epoch {ep}")
+
+    for step, batch in enumerate(pbar, start=1):
+        batch = {k: v.to(device) for k, v in batch.items()}
+        out   = model(**batch)
+        loss  = out.loss
+
+        loss.backward()
+        clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+
+        total_loss += loss.item()
+        pbar.set_postfix(loss=total_loss/step)
+
+    # ---- validation ----
+    model.eval()
+    preds_all, refs_all = [], []
+    with torch.no_grad():
+        for batch in val_loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            gen = model.generate(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                max_length=MAX_OUT,
+                num_beams=NUM_BEAMS,
+                length_penalty=LENGTH_PENALTY,
+            )
+            preds = tokenizer.batch_decode(gen, skip_special_tokens=True)
+            labels = batch["labels"].clone()
+            labels[labels == -100] = tokenizer.pad_token_id
+            refs = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+            preds_all += preds
+            refs_all  += refs
+
+    val_bleu, val_wer = compute_bleu_wer(preds_all, refs_all)
+    print(f"🔎 [VAL] BLEU={val_bleu:.2f} | WER={val_wer:.4f}")
+
+    if val_bleu > best_bleu:
+        best_bleu = val_bleu
+        epochs_no_imp = 0
+        model.save_pretrained(OUT_DIR)
+        tokenizer.save_pretrained(OUT_DIR)
+        print("💾 Saved best model ->", OUT_DIR)
+    else:
+        epochs_no_imp += 1
+        print(f"no improvement for {epochs_no_imp} epoch(s)")
+        if epochs_no_imp >= EARLY_STOP_PATIENCE:
+            print("⛔ Early stopping triggered.")
+            break
+
+# ========== I) Test with best model ==========
+from transformers import AutoModelForSeq2SeqLM as Seq2SeqLMForTest
+
+best_model = Seq2SeqLMForTest.from_pretrained(OUT_DIR).to(device)
+best_model.eval()
+
+def eval_loader(dloader, name):
+    if dloader is None:
+        print(f"\n[{name}] No test data.")
+        return None
+    preds, refs = [], []
+    with torch.no_grad():
+        for batch in dloader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            gen = best_model.generate(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                max_length=MAX_OUT,
+                num_beams=NUM_BEAMS,
+                length_penalty=LENGTH_PENALTY,
+            )
+            p = tokenizer.batch_decode(gen, skip_special_tokens=True)
+            labels = batch["labels"].clone()
+            labels[labels == -100] = tokenizer.pad_token_id
+            r = tokenizer.batch_decode(labels, skip_special_tokens=True)
+            preds += p
+            refs  += r
+    b, w, c = compute_all(preds, refs)
+    print(f"\n=== TEST ({name}) ===")
+    print(f"BLEU = {b:.2f}")
+    print(f"WER  = {w:.4f}")
+    print(f"CER  = {c:.4f}")
+    return preds, refs, b, w, c
+
+res_v  = eval_loader(dl_tv,   "Vashantor-CTG")
+res_o  = eval_loader(dl_to,   "ONUBAD-CTG")
+res_ch = eval_loader(dl_tc,   "Chatgaiya-CTG")
+res_all= eval_loader(dl_tall, "Combined All Sources")
+
+print("\nSaved model dir:", OUT_DIR)
