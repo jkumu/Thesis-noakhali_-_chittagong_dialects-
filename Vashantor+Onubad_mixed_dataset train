@@ -1,0 +1,380 @@
+# ====== BanglaT5 Fine-tune (Jupyter / Windows) ======
+# Vashantor(Chittagong) + ONUBAD (Sentence/Clause/Word)
+# Folder = current Jupyter folder (ctg.ipynb + সব CSV/XLSX এখানেই আছে)
+
+import os, glob, sys, subprocess, importlib, random
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+
+from datasets import Dataset
+from torch.utils.data import DataLoader
+from torch.nn.utils import clip_grad_norm_
+from tqdm.auto import tqdm
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    DataCollatorForSeq2Seq,
+    Adafactor,
+)
+
+# ---------------- small helper ----------------
+def ensure(pkg, pip_name=None):
+    pip_name = pip_name or pkg
+    try:
+        return importlib.import_module(pkg)
+    except ModuleNotFoundError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-qU", pip_name])
+        return importlib.import_module(pkg)
+
+evaluate = ensure("evaluate")
+jiwer    = ensure("jiwer")
+ensure("sacrebleu")
+ensure("openpyxl")
+
+# Bangla normalizer
+try:
+    from normalizer import normalize
+except Exception:
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "-qU",
+         "git+https://github.com/csebuetnlp/normalizer.git"]
+    )
+    from normalizer import normalize
+
+# ---------------- CONFIG ----------------
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark     = False
+
+TARGET_REGION = "Chittagong"
+TARGET_LANG   = "Bangla"
+
+MAX_IN, MAX_OUT = 128, 128
+BATCH      = 8
+EPOCHS     = 12
+NUM_BEAMS  = 7
+LEN_PEN    = 1.1
+MAX_GRAD   = 1.0
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+# সেভ করার ফোল্ডার (লোকাল)
+OUT_DIR = os.path.join(".", "mt_runs_combo", f"banglat5_{TARGET_REGION}_{TARGET_LANG}")
+os.makedirs(OUT_DIR, exist_ok=True)
+print("Saving to:", OUT_DIR)
+
+# ---------------- A) Load Vashantor (CTG only) ----------------
+vash_files = sorted(glob.glob("./*Translation.csv"))
+print("Found:", [Path(p).name for p in vash_files])
+assert len(vash_files) > 0, "Vashantor Translation.csv ফাইলগুলো একই ফোল্ডারে রাখো।"
+
+def guess_region_split(p):
+    name  = Path(p).name.replace(".csv", "")
+    parts = name.split()
+    split = None
+    for s in ["Train", "Validation", "Test"]:
+        if s in parts:
+            split = s.lower()
+    assert split, f"Split not found in {name}"
+    ridx   = parts.index(split.capitalize())
+    region = " ".join(parts[:ridx]).strip()
+    return region, split
+
+rows = []
+for p in vash_files:
+    region, split = guess_region_split(p)
+    if region != "Chittagong":
+        continue
+
+    df = pd.read_csv(p)
+    df.columns = [c.strip() for c in df.columns]
+    low = {c.strip().lower().replace(" ", ""): c for c in df.columns}
+
+    tgt_col = low.get("bangla_speech", None)
+    assert tgt_col, f"bangla_speech missing in {Path(p).name}"
+
+    rk = "chittagong"
+    src_col = low.get(f"{rk}_bangla_speech", None)
+    assert src_col, f"{rk}_bangla_speech missing in {Path(p).name}"
+
+    sub = df[[src_col, tgt_col]].copy()
+    sub.columns = ["src", "tgt"]
+    sub["source"] = "vashantor"
+    sub["split"]  = split
+    rows.append(sub)
+
+assert rows, "Chittagong region er Vashantor file পাইনি।"
+vash = pd.concat(rows, ignore_index=True)
+print("Vashantor CTG rows:", vash["split"].value_counts().to_dict())
+
+# ---------------- B) Load ONUBAD (Sentence/Clause/Word) ----------------
+onu_files = sorted(glob.glob("./*.csv") + glob.glob("./*.xlsx"))
+print("ONUBAD candidate files:", [Path(p).name for p in onu_files])
+
+def read_any(p):
+    if p.lower().endswith(".csv"):
+        return pd.read_csv(p)
+    else:
+        return pd.read_excel(p)
+
+def pick_cols(df, p):
+    orig = list(df.columns)
+    low  = {c: c.strip().lower() for c in orig}
+
+    ctg_keys = ["chittagong language", "chittagong", "ctg", "chattogram"]
+    std_keys = ["standard bangla language", "standard bangla",
+                "standard bengali", "bangla"]
+
+    def find(keys):
+        for k in keys:
+            for c in orig:
+                if low[c] == k:
+                    return c
+        for c in orig:
+            for k in keys:
+                if k in low[c]:
+                    return c
+        return None
+
+    src = find(ctg_keys)
+    tgt = find(std_keys)
+    if src is None or tgt is None:
+        raise ValueError(f"ONUBAD cols not found in {Path(p).name}. Have: {orig}")
+    return src, tgt
+
+onu_rows = []
+for p in onu_files:
+    try:
+        df = read_any(p)
+        src, tgt = pick_cols(df, p)
+        sub = df[[src, tgt]].copy()
+        sub.columns = ["src", "tgt"]
+        sub["source"] = "onubad"
+        onu_rows.append(sub)
+        print(f"[ONUBAD OK] {Path(p).name} -> src='{src}' | tgt='{tgt}' | rows={len(sub)}")
+    except Exception:
+        # non-onubad file হলে চুপচাপ skip
+        pass
+
+assert onu_rows, "Sentence.xlsx / Clause.xlsx / Word.xlsx থেকে ONUBAD ডাটা পাওয়া যায়নি।"
+onubad_all = pd.concat(onu_rows, ignore_index=True)
+onubad_all = onubad_all.dropna(subset=["src", "tgt"]).reset_index(drop=True)
+onubad_all["src"] = onubad_all["src"].astype(str).str.strip()
+onubad_all["tgt"] = onubad_all["tgt"].astype(str).str.strip()
+onubad_all = onubad_all[(onubad_all["src"] != "") & (onubad_all["tgt"] != "")]
+
+# 80/10/10 split for ONUBAD
+idx  = np.random.permutation(len(onubad_all))
+n_tr = int(0.8 * len(idx))
+n_va = int(0.1 * len(idx))
+
+onubad_all.loc[idx[:n_tr], "split"] = "train"
+onubad_all.loc[idx[n_tr:n_tr + n_va], "split"] = "validation"
+onubad_all.loc[idx[n_tr + n_va:], "split"] = "test"
+
+print("ONUBAD rows:", onubad_all["split"].value_counts().to_dict())
+
+# ---------------- C) Merge + normalize + dedup ----------------
+df_all = pd.concat([vash, onubad_all], ignore_index=True)
+
+def bn_norm(x):
+    try:
+        return normalize(str(x))
+    except Exception:
+        return str(x)
+
+df_all["src_norm"] = df_all["src"].astype(str).apply(bn_norm)
+df_all["tgt_norm"] = df_all["tgt"].astype(str).apply(bn_norm)
+df_all = df_all.drop_duplicates(subset=["src_norm", "tgt_norm"]).reset_index(drop=True)
+
+train = df_all[df_all["split"] == "train"].reset_index(drop=True)
+val   = df_all[df_all["split"] == "validation"].reset_index(drop=True)
+test_v = df_all[(df_all["split"] == "test") & (df_all["source"] == "vashantor")].reset_index(drop=True)
+test_o = df_all[(df_all["split"] == "test") & (df_all["source"] == "onubad")].reset_index(drop=True)
+test_c = pd.concat([test_v, test_o], ignore_index=True)
+
+print("Sizes ->", {
+    "train": len(train),
+    "val":   len(val),
+    "test_vashantor": len(test_v),
+    "test_onubad":    len(test_o),
+    "test_combined":  len(test_c),
+})
+
+print("\nSample combined train rows:")
+print(train.head())
+
+# ---------------- D) HF datasets ----------------
+MODEL = "csebuetnlp/banglat5"
+tokenizer = AutoTokenizer.from_pretrained(MODEL, use_fast=True)
+model     = AutoModelForSeq2SeqLM.from_pretrained(MODEL).to(device)
+model.config.use_cache = False
+
+def preprocess(batch):
+    inp = ["translate dialect to bangla: " + s for s in batch["src_norm"]]
+    enc = tokenizer(inp, max_length=MAX_IN, truncation=True)
+    tgt = tokenizer(
+        text_target=batch["tgt_norm"],
+        max_length=MAX_OUT,
+        truncation=True,
+    )
+    enc["labels"] = tgt["input_ids"]
+    return enc
+
+def to_hf(df):
+    base = Dataset.from_pandas(df[["src_norm", "tgt_norm"]].copy())
+    return base.map(preprocess, batched=True, remove_columns=["src_norm", "tgt_norm"])
+
+ds_tr = to_hf(train)
+ds_va = to_hf(val)
+ds_tv = to_hf(test_v)
+ds_to = to_hf(test_o)
+ds_tc = to_hf(test_c)
+
+collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding=True)
+dl_tr = DataLoader(ds_tr, batch_size=BATCH, shuffle=True,  collate_fn=collator)
+dl_va = DataLoader(ds_va, batch_size=BATCH, shuffle=False, collate_fn=collator)
+dl_tv = DataLoader(ds_tv, batch_size=BATCH, shuffle=False, collate_fn=collator)
+dl_to = DataLoader(ds_to, batch_size=BATCH, shuffle=False, collate_fn=collator)
+dl_tc = DataLoader(ds_tc, batch_size=BATCH, shuffle=False, collate_fn=collator)
+
+# ---------------- E) Metrics ----------------
+bleu = evaluate.load("sacrebleu")
+
+def BLEU(preds, refs):
+    return bleu.compute(
+        predictions=[p.strip() for p in preds],
+        references=[[r.strip()] for r in refs],
+    )["score"]
+
+def WER(preds, refs):
+    return float(np.mean([jiwer.wer(r, p) for p, r in zip(preds, refs)]))
+
+def CER(preds, refs):
+    return jiwer.cer(refs, preds)
+
+# ---------------- F) Train ----------------
+BEST = -1.0
+optimizer = Adafactor(
+    model.parameters(),
+    relative_step=True,
+    scale_parameter=True,
+    warmup_init=True,
+    lr=None,
+)
+
+for ep in range(1, EPOCHS + 1):
+    model.train()
+    agg = 0.0
+    pbar = tqdm(dl_tr, desc=f"[CTG Mix] Epoch {ep}/{EPOCHS}")
+    optimizer.zero_grad()
+
+    for i, batch in enumerate(pbar, start=1):
+        batch = {k: v.to(device) for k, v in batch.items()}
+        out   = model(**batch)
+        loss  = out.loss
+        loss.backward()
+
+        clip_grad_norm_(model.parameters(), MAX_GRAD)
+        optimizer.step()
+        optimizer.zero_grad()
+
+        agg += loss.item()
+        pbar.set_postfix(loss=agg / i)
+
+    # validation
+    model.eval()
+    preds, refs = [], []
+    with torch.no_grad():
+        for vb in dl_va:
+            vb = {k: v.to(device) for k, v in vb.items()}
+            gen = model.generate(
+                input_ids=vb["input_ids"],
+                attention_mask=vb["attention_mask"],
+                max_length=MAX_OUT,
+                num_beams=NUM_BEAMS,
+                length_penalty=LEN_PEN,
+                no_repeat_ngram_size=3,
+            )
+            pr = tokenizer.batch_decode(gen, skip_special_tokens=True)
+            lb = vb["labels"].clone()
+            lb[lb == -100] = tokenizer.pad_token_id
+            rf = tokenizer.batch_decode(lb, skip_special_tokens=True)
+            preds += pr
+            refs  += rf
+
+    val_bleu = BLEU(preds, refs)
+    print(f"\n🔎 [VAL] BLEU={val_bleu:.2f}")
+    if val_bleu > BEST:
+        BEST = val_bleu
+        model.save_pretrained(OUT_DIR)
+        tokenizer.save_pretrained(OUT_DIR)
+        print(f"✅ Saved best -> {OUT_DIR} (BLEU={BEST:.2f})")
+
+# ---------------- G) Test (Vashantor / ONUBAD / Combined) ----------------
+best = AutoModelForSeq2SeqLM.from_pretrained(OUT_DIR).to(device)
+best.eval()
+
+def eval_loader(dloader):
+    preds, refs = [], []
+    with torch.no_grad():
+        for tb in dloader:
+            tb = {k: v.to(device) for k, v in tb.items()}
+            gen = best.generate(
+                input_ids=tb["input_ids"],
+                attention_mask=tb["attention_mask"],
+                max_new_tokens=64,
+                num_beams=6,
+                no_repeat_ngram_size=4,
+                repetition_penalty=1.2,
+                length_penalty=1.0,
+                early_stopping=True,
+            )
+            pr = tokenizer.batch_decode(gen, skip_special_tokens=True)
+            lb = tb["labels"].clone()
+            lb[lb == -100] = tokenizer.pad_token_id
+            rf = tokenizer.batch_decode(lb, skip_special_tokens=True)
+            preds += pr
+            refs  += rf
+    return preds, refs, BLEU(preds, refs), WER(preds, refs), CER(preds, refs)
+
+pred_v, ref_v, b_v, w_v, c_v = eval_loader(dl_tv)
+pred_o, ref_o, b_o, w_o, c_o = eval_loader(dl_to)
+pred_c, ref_c, b_c, w_c, c_c = eval_loader(dl_tc)
+
+print("\n=== TEST (Vashantor-CTG) ===")
+print(f"BLEU: {b_v:.2f}")
+print(f"WER : {w_v:.4f}")
+print(f"CER : {c_v:.4f}")
+
+print("\n=== TEST (ONUBAD-CTG) ===")
+print(f"BLEU: {b_o:.2f}")
+print(f"WER : {w_o:.4f}")
+print(f"CER : {c_o:.4f}")
+
+print("\n=== TEST (Combined) ===")
+print(f"BLEU: {b_c:.2f}")
+print(f"WER : {w_c:.4f}")
+print(f"CER : {c_c:.4f}")
+
+# CSVs লোকাল সেভ
+os.makedirs("./preds_combo", exist_ok=True)
+pd.DataFrame({"ref": ref_v, "pred": pred_v}).to_csv(
+    "./preds_combo/preds_vashantor_ctg_mix_banglat5.csv", index=False, encoding="utf-8-sig"
+)
+pd.DataFrame({"ref": ref_o, "pred": pred_o}).to_csv(
+    "./preds_combo/preds_onubad_ctg_mix_banglat5.csv", index=False, encoding="utf-8-sig"
+)
+pd.DataFrame({"ref": ref_c, "pred": pred_c}).to_csv(
+    "./preds_combo/preds_combined_ctg_mix_banglat5.csv", index=False, encoding="utf-8-sig"
+)
+print("\nSaved prediction CSVs in ./preds_combo/ and model in:", OUT_DIR)
