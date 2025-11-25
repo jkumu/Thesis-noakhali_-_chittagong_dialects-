@@ -1,0 +1,229 @@
+import os
+import numpy as np
+import pandas as pd
+import torch
+
+from datasets import Dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    DataCollatorForSeq2Seq,
+    Adafactor,
+    get_constant_schedule
+)
+from torch.utils.data import DataLoader
+from torch.nn.utils import clip_grad_norm_
+from tqdm.auto import tqdm
+
+import evaluate
+from jiwer import wer
+
+
+# ---------- CONFIG ----------
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+TARGET_REGION = "Chittagong"
+TARGET_LANG   = "Bangla"
+
+MAX_IN, MAX_OUT = 128, 128
+BATCH_SIZE      = 8
+EPOCHS          = 15
+NUM_BEAMS       = 5          # আগে 8 ছিল, stability জন্য 5
+LENGTH_PENALTY  = 1.0
+MAX_GRAD_NORM   = 0.8
+LEARNING_RATE   = 1e-4       # fixed LR
+
+
+RUN_ROOT = "./mt_runs_v2"
+os.makedirs(RUN_ROOT, exist_ok=True)
+OUT_DIR = os.path.join(RUN_ROOT, f"banglat5_{TARGET_REGION}_{TARGET_LANG}")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+
+# ---------- Data ----------
+assert "df_clean" in globals(), "আগে df_clean তৈরি করা সেলটা চালাও!"
+
+subset = df_clean[
+    (df_clean["region"] == TARGET_REGION) &
+    (df_clean["lang"]   == TARGET_LANG)
+].copy()
+
+train_df = subset[subset["split"]=="train"].reset_index(drop=True)
+val_df   = subset[subset["split"]=="validation"].reset_index(drop=True)
+test_df  = subset[subset["split"]=="test"].reset_index(drop=True)
+
+print("Sizes:", len(train_df), len(val_df), len(test_df))
+print("\nSample train rows:")
+print(train_df.head())
+
+
+# ---------- Model + tokenizer ----------
+MODEL_NAME = "csebuetnlp/banglat5"
+tokenizer  = AutoTokenizer.from_pretrained(MODEL_NAME)
+model      = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device)
+model.config.use_cache = False
+
+
+# ---------- HF Dataset ----------
+def preprocess(batch):
+    inputs = ["translate dialect to bangla: " + s for s in batch["src_norm"]]
+    enc = tokenizer(inputs, max_length=MAX_IN, truncation=True)
+    tgt = tokenizer(
+        text_target=batch["tgt_norm"],
+        max_length=MAX_OUT,
+        truncation=True
+    )
+    enc["labels"] = tgt["input_ids"]
+    return enc
+
+def make_dataset(df):
+    base = Dataset.from_pandas(df[["src_norm", "tgt_norm"]].copy())
+    return base.map(
+        preprocess,
+        batched=True,
+        remove_columns=["src_norm", "tgt_norm"]
+    )
+
+ds_train = make_dataset(train_df)
+ds_val   = make_dataset(val_df)
+ds_test  = make_dataset(test_df)
+
+collator     = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding=True)
+train_loader = DataLoader(ds_train, batch_size=BATCH_SIZE, shuffle=True,  collate_fn=collator)
+val_loader   = DataLoader(ds_val,   batch_size=BATCH_SIZE, shuffle=False, collate_fn=collator)
+test_loader  = DataLoader(ds_test,  batch_size=BATCH_SIZE, shuffle=False, collate_fn=collator)
+
+
+# ---------- Metrics ----------
+bleu = evaluate.load("sacrebleu")
+
+def compute_bleu_wer(preds, refs):
+    preds = [p.strip() for p in preds]
+    refs1 = [r.strip() for r in refs]
+    b = bleu.compute(predictions=preds,
+                     references=[[r] for r in refs1])["score"]
+    w = float(np.mean([wer(r, p) for p, r in zip(preds, refs1)]))
+    return b, w
+
+
+# ---------- Optimizer + Scheduler ----------
+optimizer = Adafactor(
+    model.parameters(),
+    lr=LEARNING_RATE,
+    relative_step=False,
+    scale_parameter=False,
+    warmup_init=False,
+)
+scheduler = get_constant_schedule(optimizer)
+
+
+# ---------- Train loop ----------
+best_bleu = -1.0
+epochs_without_improve = 0
+
+for ep in range(1, EPOCHS + 1):
+    print(f"\n===== Epoch {ep}/{EPOCHS} =====")
+    model.train()
+    total_loss = 0.0
+
+    pbar = tqdm(train_loader)
+    for step, batch in enumerate(pbar, start=1):
+        batch = {k: v.to(device) for k, v in batch.items()}
+        out   = model(**batch)
+        loss  = out.loss
+
+        loss.backward()
+        clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+
+        total_loss += loss.item()
+        pbar.set_postfix(loss=total_loss / step)
+
+    # ----- validation -----
+    model.eval()
+    preds_all, refs_all = [], []
+    with torch.no_grad():
+        for batch in val_loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            gen = model.generate(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                max_length=MAX_OUT,
+                num_beams=NUM_BEAMS,
+                length_penalty=LENGTH_PENALTY,
+            )
+            preds = tokenizer.batch_decode(gen, skip_special_tokens=True)
+            labels = batch["labels"].clone()
+            labels[labels == -100] = tokenizer.pad_token_id
+            refs = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+            preds_all += preds
+            refs_all  += refs
+
+    val_bleu, val_wer = compute_bleu_wer(preds_all, refs_all)
+    print(f"VAL → BLEU={val_bleu:.2f}, WER={val_wer:.4f}")
+
+    # save best + early stopping
+    if val_bleu > best_bleu:
+        best_bleu = val_bleu
+        epochs_without_improve = 0
+        model.save_pretrained(OUT_DIR)
+        tokenizer.save_pretrained(OUT_DIR)
+        print("💾 Saved best model:", OUT_DIR)
+    else:
+        epochs_without_improve += 1
+        print(f"no improvement for {epochs_without_improve} epoch(s)")
+        if epochs_without_improve >= 3:
+            print("⛔ Early stopping triggered.")
+            break
+
+
+# ---------- Test with best model ----------
+from transformers import AutoModelForSeq2SeqLM as Seq2SeqLMForTest
+
+best_model = Seq2SeqLMForTest.from_pretrained(OUT_DIR).to(device)
+best_model.eval()
+
+preds_all, refs_all = [], []
+src_all = test_df["src_norm"].tolist()
+
+with torch.no_grad():
+    for batch in test_loader:
+        batch = {k: v.to(device) for k, v in batch.items()}
+        gen = best_model.generate(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            max_length=MAX_OUT,
+            num_beams=NUM_BEAMS,
+            length_penalty=LENGTH_PENALTY,
+        )
+        preds = tokenizer.batch_decode(gen, skip_special_tokens=True)
+        labels = batch["labels"].clone()
+        labels[labels == -100] = tokenizer.pad_token_id
+        refs = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+        preds_all += preds
+        refs_all  += refs
+
+test_bleu, test_wer = compute_bleu_wer(preds_all, refs_all)
+print(f"\n=== TEST ({TARGET_REGION}/{TARGET_LANG}) ===")
+print(f"BLEU = {test_bleu:.2f}")
+print(f"WER  = {test_wer:.4f}")
+print("Saved model dir:", OUT_DIR)
+
+pred_df = pd.DataFrame({"src": src_all, "ref": refs_all, "pred": preds_all})
+pred_path = f"./preds_{TARGET_REGION}_{TARGET_LANG}_banglat5_v2.csv"
+pred_df.to_csv(pred_path, index=False, encoding="utf-8-sig")
+print("Saved predictions:", pred_path)
