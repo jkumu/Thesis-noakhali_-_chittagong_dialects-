@@ -1,0 +1,13 @@
+s = "তোয়ার  হাসে আই এক্কান ফরামরশ চাই "
+print("Dialect :", s)
+print("Std Bangla:", translate_ctg(s))
+
+
+samples = [
+    "তোওয়ার বন্দুর ফোয়ারিত ফরিচয় অইয়েরে ভালো লাইজ্ঞে",
+    "আর ফসন্দ অয় এইল্লে ফোয়া আর বাবা মায়ের ফসন্দ ন অয়",
+    "তোয়ার ফোয়ারিত দেহা অইলেই ফুরান ইতিহাস মনত ফরে দ",
+]
+for d, o in zip(samples, translate_ctg(samples)):
+    print("\nDialect :", d)
+    print("Std BN  :", o)
