@@ -1,0 +1,3 @@
+txt = "তোয়ার ভালোর লাই আই তোয়ারে ছাড়ি দুরত চলি গিয়ি"
+print("Dialect:", txt)
+print("Std Bangla:", translate_ctg(txt))
