@@ -1,0 +1,16 @@
+import torch
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
+# Device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+# 👉 Saved model directory
+MODEL_DIR = r"./mt_runs_chatgaiya/banglat5_ChatgaiyaAlap_Bangla"
+
+# Load tokenizer + model
+tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_DIR).to(device)
+model.eval()
+
+print("Model loaded successfully!")
