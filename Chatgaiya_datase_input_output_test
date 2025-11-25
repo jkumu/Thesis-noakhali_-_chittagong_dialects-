@@ -1,0 +1,32 @@
+import torch
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
+# Device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+# 👉 Saved model directory
+MODEL_DIR = r"./mt_runs_chatgaiya/banglat5_ChatgaiyaAlap_Bangla"
+
+# Load tokenizer + model
+tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_DIR).to(device)
+model.eval()
+
+print("Model loaded successfully!")
+
+s = "ইতারে সাহস দিবেল লাই ধন্যবাদ"
+print("Dialect :", s)
+print("Std Bangla:", translate_chatgaiya(s))
+
+samples = [
+    "ফোয়ার মত ফোয়া অইলেতোঁয়ার লাই গম",
+    "কিন্তু মাইয়্যা চ্যাঁইতে বহুত গম আইসসিল",
+    "অ্যাঁরার তো ইয়েন থাহনের হথা আইসসিল",
+]
+
+for d, o in zip(samples, translate_chatgaiya(samples)):
+    print("\nDialect :", d)
+    print("Std BN  :", o)
+
+
